@@ -45,4 +45,7 @@ docker run --rm mlops-task
 ```
 
 ## Dependencies
-- No external Python packages are required (standard library only).
+Dependencies:
+- pandas
+- numpy
+- pyyaml
