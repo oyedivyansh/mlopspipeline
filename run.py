@@ -2,195 +2,209 @@ import argparse
 import csv
 import json
 import logging
-import os
 import random
 import sys
 import time
-from collections import deque
 from pathlib import Path
+from typing import Dict, List
 
-REQUIRED_CONFIG_FIELDS = {"seed", "window", "version"}
-REQUIRED_COLUMNS = {"close"}
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Mini MLOps batch pipeline")
-    parser.add_argument("--input", required=True, help="Input CSV file path")
-    parser.add_argument("--config", required=True, help="YAML config file path")
-    parser.add_argument("--output", required=True, help="Metrics output JSON path")
-    parser.add_argument("--log-file", required=True, help="Log file path")
-    return parser.parse_args()
+REQUIRED_CONFIG_FIELDS = ("seed", "window", "version")
 
 
-def setup_logging(log_path: str) -> None:
-    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        filename=log_path,
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        force=True,
+def setup_logger(log_file: Path) -> logging.Logger:
+    logger = logging.getLogger("mlops_task")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
-def parse_simple_yaml(path: str) -> dict:
-    data = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if ":" not in line:
-                raise ValueError("Invalid YAML configuration: expected key: value lines")
-            key, value = line.split(":", 1)
-            key = key.strip()
-            value = value.strip()
-            if value.startswith('"') and value.endswith('"'):
-                value = value[1:-1]
-            elif value.isdigit() or (value.startswith("-") and value[1:].isdigit()):
-                value = int(value)
-            data[key] = value
-    return data
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    return logger
 
 
-def load_config(config_path: str) -> dict:
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+def write_metrics(output_path: Path, metrics: Dict) -> None:
+    output_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-    config = parse_simple_yaml(config_path)
-    if not isinstance(config, dict):
-        raise ValueError("Invalid configuration file structure: expected a YAML mapping")
 
-    missing = REQUIRED_CONFIG_FIELDS - set(config.keys())
+def parse_simple_yaml(yaml_text: str) -> Dict:
+    config: Dict[str, str] = {}
+    for raw_line in yaml_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            raise ValueError(f"Invalid YAML line: {raw_line}")
+        key, value = line.split(":", 1)
+        config[key.strip()] = value.strip()
+    return config
+
+
+def load_and_validate_config(config_path: Path) -> Dict:
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    raw_config = parse_simple_yaml(config_path.read_text(encoding="utf-8"))
+
+    missing = [field for field in REQUIRED_CONFIG_FIELDS if field not in raw_config]
     if missing:
-        raise ValueError(f"Invalid configuration file structure: missing fields {sorted(missing)}")
+        raise ValueError(f"Config missing required field(s): {', '.join(missing)}")
 
-    seed = config["seed"]
-    window = config["window"]
-    version = config["version"]
+    try:
+        seed = int(raw_config["seed"])
+    except ValueError as exc:
+        raise ValueError("Invalid config: seed must be an integer") from exc
 
-    if not isinstance(seed, int):
-        raise ValueError("Invalid configuration file structure: 'seed' must be an integer")
-    if not isinstance(window, int) or window <= 0:
-        raise ValueError("Invalid configuration file structure: 'window' must be a positive integer")
-    if not isinstance(version, str) or not version.strip():
-        raise ValueError("Invalid configuration file structure: 'version' must be a non-empty string")
+    try:
+        window = int(raw_config["window"])
+    except ValueError as exc:
+        raise ValueError("Invalid config: window must be an integer") from exc
+
+    version = raw_config["version"].strip('"').strip("'")
+
+    if window <= 0:
+        raise ValueError("Invalid config: window must be a positive integer")
+    if not version:
+        raise ValueError("Invalid config: version must be a non-empty string")
 
     return {"seed": seed, "window": window, "version": version}
 
 
-def load_rows(input_path: str) -> tuple[list[dict], list[str]]:
-    if not os.path.exists(input_path):
+def load_and_validate_data(input_path: Path) -> List[float]:
+    if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
-    if not os.access(input_path, os.R_OK):
-        raise PermissionError(f"Input file is not readable: {input_path}")
+    if input_path.stat().st_size == 0:
+        raise ValueError(f"Input file is empty: {input_path}")
 
     try:
-        with open(input_path, "r", encoding="utf-8", newline="") as f:
+        with input_path.open("r", encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
             if reader.fieldnames is None:
-                raise ValueError("Invalid CSV file format: missing header row")
-            rows = list(reader)
-            headers = [h.strip() for h in reader.fieldnames]
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"Invalid CSV file format: {exc}") from exc
+                raise ValueError("Invalid CSV format: missing header row")
+            if "close" not in reader.fieldnames:
+                raise ValueError("Missing required column: close")
+
+            closes: List[float] = []
+            for idx, row in enumerate(reader, start=1):
+                close_value = row.get("close", "")
+                if close_value is None or str(close_value).strip() == "":
+                    raise ValueError(f"Invalid CSV format: empty close at row {idx}")
+                try:
+                    closes.append(float(close_value))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid CSV format: non-numeric close at row {idx}") from exc
     except csv.Error as exc:
-        raise ValueError(f"Invalid CSV file format: {exc}") from exc
+        raise ValueError(f"Invalid CSV format: {exc}") from exc
 
-    if not rows:
-        raise ValueError("Empty input file")
+    if not closes:
+        raise ValueError("Input CSV contains no rows")
 
-    missing_columns = REQUIRED_COLUMNS - set(headers)
-    if missing_columns:
-        raise ValueError(f"Missing required columns in dataset: {sorted(missing_columns)}")
-
-    return rows, headers
+    return closes
 
 
-def compute_signal_rate(rows: list[dict], window: int) -> float:
-    rolling_values: deque[float] = deque(maxlen=window)
-    signal_sum = 0
+def compute_signal_rate(closes: List[float], window: int) -> float:
+    signals: List[int] = []
+    rolling_buffer: List[float] = []
 
-    for row in rows:
-        try:
-            close_val = float(row["close"])
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Invalid CSV file format: non-numeric 'close' value encountered") from exc
+    for close in closes:
+        rolling_buffer.append(close)
+        if len(rolling_buffer) > window:
+            rolling_buffer.pop(0)
 
-        rolling_values.append(close_val)
-        rolling_mean = sum(rolling_values) / len(rolling_values)
-        signal = 1 if close_val > rolling_mean else 0
-        signal_sum += signal
+        if len(rolling_buffer) < window:
+            signals.append(0)
+            continue
 
-    return signal_sum / len(rows)
+        rolling_mean = sum(rolling_buffer) / window
+        signals.append(1 if close > rolling_mean else 0)
 
-
-def write_json(path: str, payload: dict) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(payload, file, indent=2)
+    return sum(signals) / len(signals)
 
 
-def main() -> int:
-    args = parse_args()
-    setup_logging(args.log_file)
-    start_time = time.perf_counter()
-    default_version = "v1"
+def run_job(input_path: Path, config_path: Path, output_path: Path, log_file: Path) -> int:
+    logger = setup_logger(log_file)
+    start = time.perf_counter()
+    version_for_error = "v1"
 
-    logging.info("Job started")
+    logger.info("Job started")
 
     try:
-        config = load_config(args.config)
-        seed = config["seed"]
-        window = config["window"]
-        version = config["version"]
+        config = load_and_validate_config(config_path)
+        version_for_error = config["version"]
 
-        random.seed(seed)
-        logging.info("Config loaded: seed=%s, window=%s, version=%s", seed, window, version)
-        logging.info("Configuration verified")
+        random.seed(config["seed"])
+        logger.info(
+            "Config loaded and validated | seed=%s window=%s version=%s",
+            config["seed"],
+            config["window"],
+            config["version"],
+        )
 
-        rows, _ = load_rows(args.input)
-        rows_processed = len(rows)
-        logging.info("Data loaded: %s rows", rows_processed)
+        closes = load_and_validate_data(input_path)
+        logger.info("Rows loaded: %s", len(closes))
 
-        logging.info("Rolling mean calculated with window=%s", window)
-        signal_rate = compute_signal_rate(rows, window)
-        logging.info("Signals generated")
+        logger.info("Computing rolling mean on close with window=%s", config["window"])
+        logger.info("Generating binary signal (first window-1 rows assigned signal=0)")
+        signal_rate = compute_signal_rate(closes, config["window"])
 
-        latency_ms = int((time.perf_counter() - start_time) * 1000)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+
         metrics = {
-            "version": version,
-            "rows_processed": rows_processed,
+            "version": config["version"],
+            "rows_processed": int(len(closes)),
             "metric": "signal_rate",
-            "value": round(signal_rate, 4),
+            "value": round(float(signal_rate), 4),
             "latency_ms": latency_ms,
-            "seed": seed,
+            "seed": config["seed"],
             "status": "success",
         }
+        write_metrics(output_path, metrics)
 
-        write_json(args.output, metrics)
-        logging.info("Metrics: signal_rate=%.4f, rows_processed=%s", metrics["value"], rows_processed)
-        logging.info("Job completed successfully in %sms", latency_ms)
+        logger.info("Metrics summary: %s", metrics)
+        logger.info("Job ended with status=success")
 
         print(json.dumps(metrics, indent=2))
         return 0
-    except Exception as exc:  # noqa: BLE001
-        error_payload = {
-            "version": default_version,
+
+    except Exception as exc:
+        error_metrics = {
+            "version": version_for_error,
             "status": "error",
             "error_message": str(exc),
         }
-        logging.error("Job failed: %s", exc, exc_info=True)
+        write_metrics(output_path, error_metrics)
 
-        try:
-            if os.path.exists(args.config):
-                error_payload["version"] = load_config(args.config).get("version", default_version)
-        except Exception:
-            pass
+        logger.exception("Job failed")
+        logger.info("Job ended with status=error")
 
-        write_json(args.output, error_payload)
-        print(json.dumps(error_payload, indent=2), file=sys.stderr)
+        print(json.dumps(error_metrics, indent=2))
         return 1
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Minimal MLOps-style batch job")
+    parser.add_argument("--input", required=False, default="data.csv", help="Path to input CSV")
+    parser.add_argument("--config", required=False, default="config.yaml", help="Path to YAML config")
+    parser.add_argument("--output", required=False, default="metrics.json", help="Path to output metrics JSON")
+    parser.add_argument("--log-file", required=False, default="run.log", help="Path to log file")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    args = parse_args()
+    exit_code = run_job(
+        input_path=Path(args.input),
+        config_path=Path(args.config),
+        output_path=Path(args.output),
+        log_file=Path(args.log_file),
+    )
+    raise SystemExit(exit_code)
